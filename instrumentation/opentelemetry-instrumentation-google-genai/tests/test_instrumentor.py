@@ -60,3 +60,31 @@ def test_co_filename_on_wrapped_functions(
         ), (
             f"Expected opentelemetry/instrumentation/google_genai removed from {co_filename} upon uninstrument"
         )
+
+
+def test_uninstrument_after_reinstantiation(
+    tracer_provider, logger_provider, meter_provider
+):
+    inst = GoogleGenAiSdkInstrumentor()
+    inst.instrument(
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+    )
+    assert inst.is_instrumented_by_opentelemetry is True
+
+    # Re-instantiating the singleton instrumentor runs __init__, which must not
+    # wipe saved snapshots needed for uninstrumentation.
+    reinstantiated = GoogleGenAiSdkInstrumentor()
+    assert reinstantiated.is_instrumented_by_opentelemetry is True
+
+    reinstantiated.uninstrument()
+    assert reinstantiated.is_instrumented_by_opentelemetry is False
+    assert inst.is_instrumented_by_opentelemetry is False
+
+    # Confirm wrapped functions are restored
+    co_filename = Models.generate_content.__code__.co_filename.replace(
+        "\\", "/"
+    )
+    assert "opentelemetry/instrumentation/google_genai" not in co_filename
+

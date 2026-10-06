@@ -31,16 +31,24 @@ class GoogleGenAiSdkInstrumentor(BaseInstrumentor):
     def __init__(
         self, generate_content_config_key_allowlist: AllowList | None = None
     ):
-        self._generate_content_snapshot = None
-        self._interactions_snapshot = None
-        self._embedding_snapshot = None
-        self._generate_content_config_key_allowlist = (
-            generate_content_config_key_allowlist
-            or AllowList.from_env(
-                "OTEL_GOOGLE_GENAI_GENERATE_CONTENT_CONFIG_INCLUDES",
-                excludes_env_var="OTEL_GOOGLE_GENAI_GENERATE_CONTENT_CONFIG_EXCLUDES",
+        super().__init__()
+        if not hasattr(self, "_generate_content_snapshot"):
+            self._generate_content_snapshot = None
+        if not hasattr(self, "_interactions_snapshot"):
+            self._interactions_snapshot = None
+        if not hasattr(self, "_embedding_snapshot"):
+            self._embedding_snapshot = None
+        if (
+            generate_content_config_key_allowlist is not None
+            or not hasattr(self, "_generate_content_config_key_allowlist")
+        ):
+            self._generate_content_config_key_allowlist = (
+                generate_content_config_key_allowlist
+                or AllowList.from_env(
+                    "OTEL_GOOGLE_GENAI_GENERATE_CONTENT_CONFIG_INCLUDES",
+                    excludes_env_var="OTEL_GOOGLE_GENAI_GENERATE_CONTENT_CONFIG_EXCLUDES",
+                )
             )
-        )
 
     # Inherited, abstract function from 'BaseInstrumentor'. Even though 'self' is
     # not used in the definition, a method is required per the API contract.
@@ -76,6 +84,12 @@ class GoogleGenAiSdkInstrumentor(BaseInstrumentor):
         self._embedding_snapshot = instrument_embeddings(telemetry_handler)
 
     def _uninstrument(self, **kwargs: Any):
-        uninstrument_generate_content(self._generate_content_snapshot)
-        uninstrument_interactions(self._interactions_snapshot)
-        uninstrument_embeddings(self._embedding_snapshot)
+        if self._generate_content_snapshot is not None:
+            uninstrument_generate_content(self._generate_content_snapshot)
+            self._generate_content_snapshot = None
+        if self._interactions_snapshot is not None:
+            uninstrument_interactions(self._interactions_snapshot)
+            self._interactions_snapshot = None
+        if self._embedding_snapshot is not None:
+            uninstrument_embeddings(self._embedding_snapshot)
+            self._embedding_snapshot = None
