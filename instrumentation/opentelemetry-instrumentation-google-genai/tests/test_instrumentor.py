@@ -101,6 +101,3 @@ def test_uninstrument_after_reinstantiation(
             "Expected opentelemetry/instrumentation/google_genai "
             f"removed from {co_filename} upon uninstrument"
         )
-
-
-
