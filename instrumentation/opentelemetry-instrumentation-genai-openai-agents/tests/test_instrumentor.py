@@ -59,15 +59,21 @@ def test_instrument_adds_processor_alongside_default() -> None:
     assert len(_our_processors()) == 0
 
 
-def test_uninstrument_after_reinstantiation() -> None:
+@pytest.mark.parametrize("disable_openai_trace_export", [False, True])
+def test_uninstrument_after_reinstantiation(
+    disable_openai_trace_export: bool,
+) -> None:
+    baseline = _registered_processors()
     instrumentor = OpenAIAgentsInstrumentor()
-    instrumentor.instrument()
+    instrumentor.instrument(
+        disable_openai_trace_export=disable_openai_trace_export,
+    )
     try:
         assert len(_our_processors()) == 1
     finally:
-        # Re-instantiate the singleton: __init__ should not reset _processor
         OpenAIAgentsInstrumentor().uninstrument()
     assert len(_our_processors()) == 0
+    assert _registered_processors() == baseline
 
 
 def test_instrument_with_disable_openai_trace_export_replaces_processors() -> (
