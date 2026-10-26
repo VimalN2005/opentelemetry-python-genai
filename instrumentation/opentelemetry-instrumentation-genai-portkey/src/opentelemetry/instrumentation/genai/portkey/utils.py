@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
@@ -18,6 +19,7 @@ from opentelemetry.util.genai.handler import TelemetryHandler
 from opentelemetry.util.genai.invocation import InferenceInvocation
 from opentelemetry.util.genai.types import (
     BlobPart,
+    FilePart,
     FunctionToolDefinition,
     InputMessage,
     MessagePart,
@@ -28,9 +30,8 @@ from opentelemetry.util.genai.types import (
     ToolCallRequest,
     ToolCallResponse,
     ToolDefinition,
-    UriPart,
 )
-from opentelemetry.util.genai.utils import image_from_url
+from opentelemetry.util.genai.utils import decode_base64, image_from_url
 
 if TYPE_CHECKING:
     from portkey_ai import AsyncPortkey, Portkey
@@ -120,9 +121,176 @@ def get_server_address_and_port(
     return address, port
 
 
-def _extract_tool_calls(tool_calls: Iterable[Any]) -> list[ToolCallRequest]:
+_AUDIO_MIME_TYPES = {"wav": "audio/wav", "mp3": "audio/mpeg"}
+
+
+def _audio_to_part(input_audio: object) -> MessagePart | None:
+    """Build a blob part for an ``input_audio`` descriptor."""
+    if input_audio is None:
+        return None
+    data = get_property_value(input_audio, "data")
+    if not isinstance(data, str):
+        return None
+    decoded = decode_base64(data)
+    if decoded is None:
+        return None
+    audio_format = get_property_value(input_audio, "format")
+    mime_type = (
+        _AUDIO_MIME_TYPES.get(audio_format)
+        if isinstance(audio_format, str)
+        else None
+    )
+    return BlobPart(
+        mime_type=mime_type,
+        modality=Modality.AUDIO,
+        content=decoded,
+    )
+
+
+def _document_to_part(file_obj: object) -> MessagePart | None:
+    """Build a part for a file descriptor: a reference when the file is
+    hosted by OpenAI (``file_id``), a blob when it is uploaded inline
+    (``file_data``)."""
+    if file_obj is None:
+        return None
+    filename = get_property_value(file_obj, "filename")
+    mime_type = (
+        mimetypes.guess_type(filename)[0]
+        if isinstance(filename, str) and filename
+        else None
+    )
+    file_id = get_property_value(file_obj, "file_id")
+    if isinstance(file_id, str) and file_id:
+        return FilePart(
+            mime_type=mime_type, modality=Modality.DOCUMENT, file_id=file_id
+        )
+    file_data = get_property_value(file_obj, "file_data")
+    if not isinstance(file_data, str) or not file_data:
+        return None
+    if file_data.startswith("data:"):
+        return image_from_url(file_data, modality=Modality.DOCUMENT)
+    content = decode_base64(file_data)
+    if content is None:
+        return None
+    return BlobPart(
+        mime_type=mime_type, modality=Modality.DOCUMENT, content=content
+    )
+
+
+def _tool_response_to_data(value: object) -> Any:
+    """Reduce a tool result payload to data the GenAI attributes can carry."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _tool_response_to_data(model_dump())
+    if isinstance(value, Mapping):
+        mapping_val = cast(Mapping[object, object], value)
+        return {
+            str(key): _tool_response_to_data(item)
+            for key, item in mapping_val.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(
+        value, (bytes, bytearray)
+    ):
+        seq_val = cast(Sequence[object], value)
+        return [_tool_response_to_data(item) for item in seq_val]
+    return None
+
+
+def _content_to_parts(content: object) -> list[MessagePart]:
+    if isinstance(content, str):
+        return [Text(content=content)]
+    if isinstance(content, MessagePart):
+        return [content]
+    seq: Sequence[object]
+    if isinstance(content, Mapping):
+        seq = [cast(object, content)]
+    elif isinstance(content, Sequence) and not isinstance(
+        content, (bytes, bytearray)
+    ):
+        seq = cast(Sequence[object], content)
+    else:
+        return []
+
+    parts: list[MessagePart] = []
+    for item in seq:
+        if isinstance(item, str):
+            parts.append(Text(content=item))
+            continue
+        if isinstance(item, MessagePart):
+            parts.append(item)
+            continue
+
+        part_type = get_property_value(item, "type")
+        text = get_property_value(item, "text")
+        if part_type in ("text", "input_text", "output_text") or (
+            part_type is None and isinstance(text, str)
+        ):
+            if isinstance(text, str):
+                parts.append(Text(content=text))
+            continue
+
+        if part_type == "input_audio":
+            audio_part = _audio_to_part(
+                get_property_value(item, "input_audio")
+            )
+            if audio_part is not None:
+                parts.append(audio_part)
+            continue
+
+        if part_type in ("file", "input_file"):
+            file_part = _document_to_part(
+                get_property_value(item, "file") or item
+            )
+            if file_part is not None:
+                parts.append(file_part)
+            continue
+
+        if part_type == "refusal":
+            refusal = get_property_value(item, "refusal")
+            if isinstance(refusal, str):
+                parts.append(Text(content=refusal))
+            continue
+
+        if part_type not in ("image_url", "input_image") and (
+            part_type is not None
+            or get_property_value(item, "image_url") is None
+        ):
+            continue
+
+        image_url = get_property_value(item, "image_url")
+        if not isinstance(image_url, str):
+            image_url = get_property_value(image_url, "url")
+        if isinstance(image_url, str) and image_url:
+            image_part = image_from_url(image_url)
+            if image_part is not None:
+                parts.append(image_part)
+            continue
+
+        file_id = get_property_value(item, "file_id")
+        if (
+            part_type == "input_image"
+            and isinstance(file_id, str)
+            and file_id
+        ):
+            parts.append(
+                FilePart(
+                    mime_type=None,
+                    modality=Modality.IMAGE,
+                    file_id=file_id,
+                )
+            )
+
+    return parts
+
+
+def _extract_tool_calls(tool_calls: object) -> list[ToolCallRequest]:
+    if not isinstance(tool_calls, Iterable):
+        return []
     parts: list[ToolCallRequest] = []
-    for tool_call in tool_calls:
+    tc_seq = cast(Iterable[object], tool_calls)
+    for tool_call in tc_seq:
         call_id = get_property_value(tool_call, "id")
         func_name = ""
         arguments: Any = None
@@ -147,73 +315,62 @@ def _extract_tool_calls(tool_calls: Iterable[Any]) -> list[ToolCallRequest]:
     return parts
 
 
-def _prepare_input_messages(messages: Iterable[Any]) -> list[InputMessage]:
+def _prepare_input_messages(
+    messages: object | None,
+) -> list[InputMessage]:
+    if not isinstance(messages, Iterable):
+        return []
     chat_messages: list[InputMessage] = []
-    for message in messages:
+    msg_seq = cast(Iterable[object], messages)
+    for message in msg_seq:
         role = get_property_value(message, "role")
-        if role is None:
-            continue
+        name = get_property_value(message, "name")
         parts: list[MessagePart] = []
         content = get_property_value(message, "content")
         tool_calls = get_property_value(message, "tool_calls")
         tool_call_id = get_property_value(message, "tool_call_id")
 
-        if tool_calls is not None and isinstance(tool_calls, Iterable):
-            parts.extend(_extract_tool_calls(cast(Iterable[Any], tool_calls)))
-        if tool_call_id is not None:
+        if role == Role.ASSISTANT.value:
+            if tool_calls is not None:
+                parts.extend(_extract_tool_calls(tool_calls))
+            parts.extend(_content_to_parts(content))
+            refusal = get_property_value(message, "refusal")
+            if isinstance(refusal, str):
+                parts.append(Text(content=refusal))
+        elif role == Role.TOOL.value or tool_call_id is not None:
             parts.append(
-                ToolCallResponse(id=str(tool_call_id), response=content)
-            )
-        elif content:
-            if isinstance(content, str):
-                parts.append(Text(content=content))
-            elif isinstance(content, Mapping):
-                parts.extend(
-                    _extract_content_part(cast(Mapping[str, Any], content))
+                ToolCallResponse(
+                    id=str(tool_call_id) if tool_call_id is not None else None,
+                    response=_tool_response_to_data(content),
                 )
-            elif isinstance(content, Sequence) and not isinstance(
-                content, (bytes, bytearray)
-            ):
-                for item in content:
-                    if isinstance(item, str):
-                        parts.append(Text(content=item))
-                    elif isinstance(item, Mapping):
-                        parts.extend(
-                            _extract_content_part(
-                                cast(Mapping[str, Any], item)
-                            )
-                        )
-                    elif isinstance(item, (BlobPart, UriPart, Text)):
-                        parts.append(item)
-        chat_messages.append(InputMessage(role=str(role), parts=parts))
+            )
+        else:
+            if tool_calls is not None:
+                parts.extend(_extract_tool_calls(tool_calls))
+            parts.extend(_content_to_parts(content))
+            refusal = get_property_value(message, "refusal")
+            if isinstance(refusal, str):
+                parts.append(Text(content=refusal))
+
+        if parts:
+            chat_messages.append(
+                InputMessage(
+                    role=str(role) if role is not None else "",
+                    parts=parts,
+                    name=str(name) if name is not None else None,
+                )
+            )
     return chat_messages
 
 
-def _extract_content_part(item: Mapping[str, Any]) -> list[MessagePart]:
-    item_type = get_property_value(item, "type")
-    text = get_property_value(item, "text")
-    if item_type == "text" or (item_type is None and isinstance(text, str)):
-        if text:
-            return [Text(content=str(text))]
-        return []
-    if item_type in ("image_url", "input_image") or "image_url" in item:
-        image_url = get_property_value(item, "image_url")
-        if not isinstance(image_url, str):
-            image_url = get_property_value(image_url, "url")
-        if isinstance(image_url, str) and image_url:
-            part = image_from_url(image_url)
-            if part is not None:
-                return [part]
-    return []
-
-
 def _prepare_tool_definitions(
-    tools: Iterable[Any] | None,
+    tools: object | None,
 ) -> list[ToolDefinition] | None:
-    if not tools:
+    if not isinstance(tools, Iterable):
         return None
+    tools_seq = cast(Iterable[object], tools)
     definitions: list[ToolDefinition] = []
-    for tool in tools:
+    for tool in tools_seq:
         tool_type = get_property_value(tool, "type")
         if tool_type == "function":
             func = get_property_value(tool, "function")
@@ -287,6 +444,8 @@ def _apply_request_parameters(
     invocation: InferenceInvocation,
     kwargs: dict[str, Any],
     capture_content: bool,
+    *,
+    is_prompt: bool = False,
 ) -> None:
     if (temp := get_value(kwargs.get("temperature"))) is not None:
         invocation.temperature = _as_float(temp)
@@ -347,26 +506,27 @@ def _apply_request_parameters(
             else:
                 invocation.output_type = response_format
 
-    tools = kwargs.get("tools")
-    if (
-        tools is not None
-        and isinstance(tools, Sequence)
-        and not isinstance(tools, (str, bytes, bytearray))
-    ):
-        invocation.tool_definitions = _prepare_tool_definitions(
-            cast(Iterable[Any], tools)
-        )
-
-    if capture_content:
-        messages = kwargs.get("messages")
+    if is_prompt:
+        tools = kwargs.get("tools")
         if (
-            messages is not None
-            and isinstance(messages, Sequence)
-            and not isinstance(messages, (str, bytes, bytearray))
+            tools is not None
+            and isinstance(tools, Sequence)
+            and not isinstance(tools, (str, bytes, bytearray))
         ):
-            invocation.input_messages = _prepare_input_messages(
-                cast(Iterable[Any], messages)
+            invocation.tool_definitions = _prepare_tool_definitions(
+                cast(object, tools)
             )
+
+        if capture_content:
+            messages = kwargs.get("messages")
+            if (
+                messages is not None
+                and isinstance(messages, Sequence)
+                and not isinstance(messages, (str, bytes, bytearray))
+            ):
+                invocation.input_messages = _prepare_input_messages(
+                    cast(object, messages)
+                )
 
 
 def create_inference_invocation(
@@ -377,7 +537,8 @@ def create_inference_invocation(
     *,
     is_prompt: bool = False,
 ) -> InferenceInvocation:
-    """Create an InferenceInvocation for a chat or prompt completions request."""
+    """Create an InferenceInvocation for a chat or prompt completions
+    request."""
     client = getattr(instance, "_client", instance)
     provider = get_provider(client)
     address, port = get_server_address_and_port(client)
@@ -398,7 +559,9 @@ def create_inference_invocation(
                 prompt_id
             )
 
-    _apply_request_parameters(invocation, kwargs, capture_content)
+    _apply_request_parameters(
+        invocation, kwargs, capture_content, is_prompt=is_prompt
+    )
     return invocation
 
 
