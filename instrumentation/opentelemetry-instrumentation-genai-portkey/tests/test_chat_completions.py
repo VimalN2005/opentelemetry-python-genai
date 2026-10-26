@@ -750,3 +750,120 @@ def test_chat_completions_provider_mapping(
             span.attributes.get(GenAIAttributes.GEN_AI_PROVIDER_NAME)
             == expected_provider
         )
+
+
+def test_sync_chat_completions_generator_content_not_consumed(
+    tracer_provider, logger_provider, meter_provider
+):
+    with instrument(
+        PortkeyInstrumentor(),
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        p = Portkey(api_key="test_pk")
+        mock_resp = _create_mock_chat_completion()
+        _setup_mock_chat(p, mock_resp)
+
+        items = [{"type": "text", "text": "streaming piece"}]
+        gen = (item for item in items)
+
+        p.chat.completions.create(
+            messages=[{"role": "user", "content": gen}],
+            model="gpt-4o",
+        )
+
+        assert list(gen) == items
+
+
+def test_sync_chat_completions_tuple_inputs(
+    tracer_provider, logger_provider, meter_provider, span_exporter
+):
+    with instrument(
+        PortkeyInstrumentor(),
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        p = Portkey(api_key="test_pk")
+        mock_resp = _create_mock_chat_completion()
+        _setup_mock_chat(p, mock_resp)
+
+        p.chat.completions.create(
+            messages=(
+                {
+                    "role": "user",
+                    "content": ({"type": "text", "text": "tuple content"},),
+                },
+            ),
+            model="gpt-4o",
+        )
+
+        spans = span_exporter.get_finished_spans()
+        assert len(spans) == 1
+        input_messages = json.loads(
+            spans[0].attributes.get(GenAIAttributes.GEN_AI_INPUT_MESSAGES)
+        )
+        assert len(input_messages) == 1
+        assert input_messages[0]["role"] == "user"
+        assert input_messages[0]["parts"][0]["content"] == "tuple content"
+
+
+def test_sync_chat_completions_image_parts(
+    tracer_provider, logger_provider, meter_provider, span_exporter
+):
+    with instrument(
+        PortkeyInstrumentor(),
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        p = Portkey(api_key="test_pk")
+        mock_resp = _create_mock_chat_completion()
+        _setup_mock_chat(p, mock_resp)
+
+        base64_img = (
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAf"
+            "FcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+        )
+        p.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Look at these images"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://example.com/test.png"
+                            },
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": base64_img},
+                        },
+                    ],
+                }
+            ],
+            model="gpt-4o",
+        )
+
+        spans = span_exporter.get_finished_spans()
+        assert len(spans) == 1
+        input_messages = json.loads(
+            spans[0].attributes.get(GenAIAttributes.GEN_AI_INPUT_MESSAGES)
+        )
+        assert len(input_messages) == 1
+        parts = input_messages[0]["parts"]
+        assert len(parts) == 3
+        assert parts[0]["type"] == "text"
+        assert parts[0]["content"] == "Look at these images"
+        assert parts[1]["type"] == "uri"
+        assert parts[1]["uri"] == "https://example.com/test.png"
+        assert parts[1]["modality"] == "image"
+        assert parts[2]["type"] == "blob"
+        assert parts[2]["modality"] == "image"
+        assert parts[2]["mime_type"] == "image/png"

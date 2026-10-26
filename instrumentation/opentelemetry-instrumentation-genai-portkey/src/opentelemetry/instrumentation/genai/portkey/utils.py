@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
@@ -17,6 +17,7 @@ from opentelemetry.semconv._incubating.attributes import (
 from opentelemetry.util.genai.handler import TelemetryHandler
 from opentelemetry.util.genai.invocation import InferenceInvocation
 from opentelemetry.util.genai.types import (
+    BlobPart,
     FunctionToolDefinition,
     InputMessage,
     MessagePart,
@@ -27,7 +28,9 @@ from opentelemetry.util.genai.types import (
     ToolCallRequest,
     ToolCallResponse,
     ToolDefinition,
+    UriPart,
 )
+from opentelemetry.util.genai.utils import image_from_url
 
 if TYPE_CHECKING:
     from portkey_ai import AsyncPortkey, Portkey
@@ -165,21 +168,43 @@ def _prepare_input_messages(messages: Iterable[Any]) -> list[InputMessage]:
             if isinstance(content, str):
                 parts.append(Text(content=content))
             elif isinstance(content, Mapping):
-                content_dict = cast(Mapping[str, Any], content)
-                content_type = content_dict.get("type")
-                if content_type == "text" and content_dict.get("text"):
-                    parts.append(Text(content=str(content_dict["text"])))
-            elif isinstance(content, Iterable):
-                for item in cast(Iterable[Any], content):
+                parts.extend(
+                    _extract_content_part(cast(Mapping[str, Any], content))
+                )
+            elif isinstance(content, Sequence) and not isinstance(
+                content, (bytes, bytearray)
+            ):
+                for item in content:
                     if isinstance(item, str):
                         parts.append(Text(content=item))
                     elif isinstance(item, Mapping):
-                        item_dict = cast(Mapping[str, Any], item)
-                        item_type = item_dict.get("type")
-                        if item_type == "text" and item_dict.get("text"):
-                            parts.append(Text(content=str(item_dict["text"])))
+                        parts.extend(
+                            _extract_content_part(
+                                cast(Mapping[str, Any], item)
+                            )
+                        )
+                    elif isinstance(item, (BlobPart, UriPart, Text)):
+                        parts.append(item)
         chat_messages.append(InputMessage(role=str(role), parts=parts))
     return chat_messages
+
+
+def _extract_content_part(item: Mapping[str, Any]) -> list[MessagePart]:
+    item_type = get_property_value(item, "type")
+    text = get_property_value(item, "text")
+    if item_type == "text" or (item_type is None and isinstance(text, str)):
+        if text:
+            return [Text(content=str(text))]
+        return []
+    if item_type in ("image_url", "input_image") or "image_url" in item:
+        image_url = get_property_value(item, "image_url")
+        if not isinstance(image_url, str):
+            image_url = get_property_value(image_url, "url")
+        if isinstance(image_url, str) and image_url:
+            part = image_from_url(image_url)
+            if part is not None:
+                return [part]
+    return []
 
 
 def _prepare_tool_definitions(
@@ -323,14 +348,22 @@ def _apply_request_parameters(
                 invocation.output_type = response_format
 
     tools = kwargs.get("tools")
-    if tools is not None and isinstance(tools, Iterable):
+    if (
+        tools is not None
+        and isinstance(tools, Sequence)
+        and not isinstance(tools, (str, bytes, bytearray))
+    ):
         invocation.tool_definitions = _prepare_tool_definitions(
             cast(Iterable[Any], tools)
         )
 
     if capture_content:
         messages = kwargs.get("messages")
-        if messages is not None and isinstance(messages, Iterable):
+        if (
+            messages is not None
+            and isinstance(messages, Sequence)
+            and not isinstance(messages, (str, bytes, bytearray))
+        ):
             invocation.input_messages = _prepare_input_messages(
                 cast(Iterable[Any], messages)
             )
