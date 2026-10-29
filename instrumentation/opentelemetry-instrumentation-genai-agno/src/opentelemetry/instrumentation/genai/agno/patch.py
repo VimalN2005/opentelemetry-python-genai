@@ -487,6 +487,107 @@ def _extract_resumed_tools(run_response: object) -> list[object]:
     return []
 
 
+def _extract_workflow_step_requirement_messages(
+    wrapped: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> list[InputMessage]:
+    step_reqs_arg: object = get_argument(
+        "step_requirements", wrapped, args, kwargs
+    )
+    reqs_list: list[object] = []
+    if (
+        step_reqs_arg is not None
+        and isinstance(step_reqs_arg, Iterable)
+        and not isinstance(step_reqs_arg, (str, bytes, Mapping))
+    ):
+        reqs_list = list(cast(Iterable[object], step_reqs_arg))
+    elif step_reqs_arg is None:
+        run_response = get_argument("run_response", wrapped, args, kwargs)
+        if run_response is not None:
+            resp_reqs: object = _get_property_value(
+                run_response, "step_requirements"
+            )
+            if (
+                resp_reqs is not None
+                and isinstance(resp_reqs, Iterable)
+                and not isinstance(resp_reqs, (str, bytes, Mapping))
+            ):
+                all_reqs = list(cast(Iterable[object], resp_reqs))
+                if all_reqs:
+                    reqs_list = [all_reqs[-1]]
+
+    if not reqs_list:
+        return []
+
+    messages: list[InputMessage] = []
+    for req in reqs_list:
+        is_resolved = getattr(req, "is_resolved", None)
+        resolved = (
+            bool(is_resolved)
+            if isinstance(is_resolved, bool)
+            else (callable(is_resolved) and bool(is_resolved()))
+        )
+        if not resolved:
+            continue
+
+        req_data: dict[str, Any] = {}
+        step_id = _get_property_value(req, "step_id")
+        if step_id is not None:
+            req_data["step_id"] = str(step_id)
+        step_name = _get_property_value(req, "step_name")
+        if step_name is not None:
+            req_data["step_name"] = str(step_name)
+
+        requires_confirmation = _get_property_value(
+            req, "requires_confirmation"
+        )
+        confirmed = _get_property_value(req, "confirmed")
+        if requires_confirmation and confirmed is not None:
+            req_data["confirmed"] = bool(confirmed)
+            note = _get_property_value(req, "confirmation_message")
+            if note:
+                req_data["confirmation_message"] = str(note)
+            rejection = _get_property_value(req, "rejection_feedback")
+            if rejection:
+                req_data["rejection_feedback"] = str(rejection)
+
+        requires_user_input = _get_property_value(
+            req, "requires_user_input"
+        )
+        user_input = _get_property_value(req, "user_input")
+        if requires_user_input and user_input is not None:
+            req_data["user_input"] = user_input
+
+        requires_route_selection = _get_property_value(
+            req, "requires_route_selection"
+        )
+        selected_choices = _get_property_value(req, "selected_choices")
+        if requires_route_selection and selected_choices is not None:
+            req_data["selected_choices"] = selected_choices
+
+        requires_output_review = _get_property_value(
+            req, "requires_output_review"
+        )
+        edited_output = _get_property_value(req, "edited_output")
+        if requires_output_review:
+            if confirmed is not None:
+                req_data["output_reviewed"] = bool(confirmed)
+            if edited_output is not None:
+                req_data["edited_output"] = edited_output
+
+        if req_data:
+            content_str = format_content(req_data)
+            messages.append(
+                InputMessage(
+                    role=Role.USER.value,
+                    parts=[TextPart(content=content_str)],
+                )
+            )
+
+    return messages
+
+
 def _set_continue_invocation_input(
     invocation: LocalAgentInvocation | WorkflowInvocation,
     wrapped: Callable[..., Any],
@@ -554,11 +655,17 @@ def _set_continue_invocation_input(
                     ],
                 )
             )
+    else:
+        messages.extend(
+            _extract_workflow_step_requirement_messages(
+                wrapped, args, kwargs
+            )
+        )
 
     input_val = (
         get_argument("input", wrapped, args, kwargs)
         if isinstance(invocation, LocalAgentInvocation)
-        else None
+        else get_argument("execution_input", wrapped, args, kwargs)
     )
     if input_val is not None:
         content_str = _extract_input_content(input_val)
