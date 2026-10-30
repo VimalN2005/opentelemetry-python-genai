@@ -495,30 +495,29 @@ def _extract_workflow_step_requirement_messages(
     step_reqs_arg: object = get_argument(
         "step_requirements", wrapped, args, kwargs
     )
-    reqs_list: list[object] = []
-    if (
-        step_reqs_arg is not None
-        and isinstance(step_reqs_arg, Iterable)
-        and not isinstance(step_reqs_arg, (str, bytes, Mapping))
-    ):
-        reqs_list = list(cast(Iterable[object], step_reqs_arg))
-    elif step_reqs_arg is None:
+    reqs_source: object = step_reqs_arg
+    if reqs_source is None:
         run_response = get_argument("run_response", wrapped, args, kwargs)
         if run_response is not None:
-            resp_reqs: object = _get_property_value(
+            reqs_source = _get_property_value(
                 run_response, "step_requirements"
             )
-            if (
-                resp_reqs is not None
-                and isinstance(resp_reqs, Iterable)
-                and not isinstance(resp_reqs, (str, bytes, Mapping))
-            ):
-                all_reqs = list(cast(Iterable[object], resp_reqs))
-                if all_reqs:
-                    reqs_list = [all_reqs[-1]]
 
-    if not reqs_list:
+    if (
+        reqs_source is None
+        or not isinstance(reqs_source, Iterable)
+        or isinstance(reqs_source, (str, bytes, Mapping))
+    ):
         return []
+
+    all_reqs = list(cast(Iterable[object], reqs_source))
+    if not all_reqs:
+        return []
+
+    # In Agno workflows, earlier entries are resolved history from previous
+    # pause/continue cycles; only the last entry represents the active
+    # requirement being continued in this run.
+    reqs_list = [all_reqs[-1]]
 
     messages: list[InputMessage] = []
     for req in reqs_list:
@@ -552,9 +551,7 @@ def _extract_workflow_step_requirement_messages(
             if rejection:
                 req_data["rejection_feedback"] = str(rejection)
 
-        requires_user_input = _get_property_value(
-            req, "requires_user_input"
-        )
+        requires_user_input = _get_property_value(req, "requires_user_input")
         user_input = _get_property_value(req, "user_input")
         if requires_user_input and user_input is not None:
             req_data["user_input"] = user_input
@@ -575,6 +572,78 @@ def _extract_workflow_step_requirement_messages(
                 req_data["output_reviewed"] = bool(confirmed)
             if edited_output is not None:
                 req_data["edited_output"] = edited_output
+
+        requires_executor_input = _get_property_value(
+            req, "requires_executor_input"
+        )
+        if requires_executor_input:
+            executor_id = _get_property_value(req, "executor_id")
+            if executor_id:
+                req_data["executor_id"] = str(executor_id)
+            executor_name = _get_property_value(req, "executor_name")
+            if executor_name:
+                req_data["executor_name"] = str(executor_name)
+
+            exec_reqs = _get_property_value(req, "executor_requirements")
+            if (
+                exec_reqs
+                and isinstance(exec_reqs, Iterable)
+                and not isinstance(exec_reqs, (str, bytes, Mapping))
+            ):
+                resolved_exec_reqs: list[dict[str, Any]] = []
+                for er in cast(Iterable[object], exec_reqs):
+                    tool_exec = getattr(er, "tool_execution", None)
+                    if tool_exec is None and isinstance(er, Mapping):
+                        tool_exec = cast(dict[str, Any], er).get(
+                            "tool_execution"
+                        )
+
+                    er_data: dict[str, Any] = {}
+                    if tool_exec is not None:
+                        t_call_id = _get_property_value(
+                            tool_exec, "tool_call_id"
+                        )
+                        if t_call_id is not None:
+                            er_data["tool_call_id"] = str(t_call_id)
+                        t_name = _get_property_value(tool_exec, "tool_name")
+                        if t_name is not None:
+                            er_data["tool_name"] = str(t_name)
+                        conf = _get_property_value(tool_exec, "confirmed")
+                        if conf is not None:
+                            er_data["confirmed"] = bool(conf)
+                        note = _get_property_value(
+                            tool_exec, "confirmation_note"
+                        )
+                        if note is not None:
+                            er_data["confirmation_note"] = str(note)
+                        res = _get_property_value(tool_exec, "result")
+                        if res is not None:
+                            er_data["result"] = res
+
+                        input_schema = getattr(
+                            tool_exec, "user_input_schema", None
+                        )
+                        if input_schema:
+                            er_data["user_input"] = {
+                                field.name: field.value
+                                for field in input_schema
+                                if getattr(field, "value", None) is not None
+                            }
+                        feedback_schema = getattr(
+                            tool_exec, "user_feedback_schema", None
+                        )
+                        if feedback_schema:
+                            er_data["user_feedback"] = {
+                                q.question: q.selected_options
+                                for q in feedback_schema
+                                if getattr(q, "selected_options", None)
+                                is not None
+                            }
+                    if er_data:
+                        resolved_exec_reqs.append(er_data)
+
+                if resolved_exec_reqs:
+                    req_data["executor_requirements"] = resolved_exec_reqs
 
         if req_data:
             content_str = format_content(req_data)
@@ -657,9 +726,7 @@ def _set_continue_invocation_input(
             )
     else:
         messages.extend(
-            _extract_workflow_step_requirement_messages(
-                wrapped, args, kwargs
-            )
+            _extract_workflow_step_requirement_messages(wrapped, args, kwargs)
         )
 
     input_val = (
